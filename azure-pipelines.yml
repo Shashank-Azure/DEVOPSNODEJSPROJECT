@@ -1,0 +1,436 @@
+trigger:
+  - main
+
+variables:
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: 'your-acr-service-connection'
+  imageRepository: 'react-app'
+  containerRegistry: 'your-registry.azurecr.io'
+  dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
+  tag: '$(Build.BuildId)'
+  
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+  # Kubernetes Namespace
+  k8sNamespace: 'production'
+  k8sConnection: 'your-k8s-service-connection'
+  monitoringNamespace: 'monitoring'
+
+  # JFrog Artifactory
+  artifactoryService: 'your-artifactory-service'
+  artifactoryRepo: 'npm-local'
+  artifactVersion: '1.0.$(Build.BuildId)'
+
+stages:
+- stage: CodeValidation
+  displayName: Code Validation
+  jobs:
+  - job: Validation
+    displayName: Code Quality Checks
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '20.x'
+      displayName: 'Install Node.js'
+      
+    - script: |
+        npm install
+        npm run lint
+      displayName: 'Run ESLint'
+      
+    - script: |
+        npx prettier --check "src/**/*.{ts,tsx}"
+      displayName: 'Check Code Formatting'
+
+    - script: |
+        npm audit
+      displayName: 'NPM Security Audit'
+
+- stage: Test
+  displayName: Test stage
+  jobs:
+  - job: UnitTests
+    displayName: Run Unit Tests
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '20.x'
+      displayName: 'Install Node.js'
+      
+    - script: |
+        npm install
+        npm run test
+      displayName: 'Run Tests'
+      
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/junit.xml'
+        mergeTestResults: true
+        testRunTitle: 'Unit Tests'
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(System.DefaultWorkingDirectory)/coverage/cobertura-coverage.xml'
+        reportDirectory: '$(System.DefaultWorkingDirectory)/coverage'
+
+  - job: IntegrationTests
+    displayName: Run Integration Tests
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - script: |
+        npm install
+        npm run test:integration
+      displayName: 'Run Integration Tests'
+
+  - job: E2ETests
+    displayName: Run E2E Tests
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - script: |
+        npm install
+        npm run test:e2e
+      displayName: 'Run E2E Tests'
+
+- stage: CodeQuality
+  displayName: Code Quality Analysis
+  jobs:
+  - job: SonarQube
+    steps:
+    - task: SonarQubePrepare@5
+      inputs:
+        SonarQube: 'Your-SonarQube-Service-Connection'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'your-project-key'
+        cliProjectName: 'Your Project Name'
+        cliSources: '.'
+        extraProperties: |
+          sonar.sourceEncoding=UTF-8
+          sonar.javascript.lcov.reportPaths=coverage/lcov.info
+          sonar.coverage.exclusions=**/*.test.ts,**/*.test.tsx,**/*.spec.ts,**/*.spec.tsx
+          sonar.test.inclusions=**/*.test.ts,**/*.test.tsx,**/*.spec.ts,**/*.spec.tsx
+          sonar.exclusions=**/node_modules/**,**/coverage/**,**/.next/**,**/dist/**
+
+    - task: SonarQubeAnalyze@5
+    - task: SonarQubePublish@5
+    
+  - job: CodeQL
+    steps:
+    - task: CodeQL@1
+      inputs:
+        language: 'javascript'
+        queries: 'security-extended'
+
+- stage: SecurityScan
+  displayName: Security Scan
+  jobs:
+  - job: SecurityScan
+    displayName: Run Security Scans
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '20.x'
+      displayName: 'Install Node.js'
+
+    - script: |
+        npm install -g snyk
+        snyk auth $(SNYK_TOKEN)
+        snyk test
+        snyk container test $(containerRegistry)/$(imageRepository):$(tag)
+      displayName: 'Run Snyk Security Scan'
+      env:
+        SNYK_TOKEN: $(snykToken)
+
+    - task: ContainerScan@0
+      inputs:
+        dockerRegistryServiceConnection: $(dockerRegistryServiceConnection)
+        repository: $(imageRepository)
+        tag: $(tag)
+      displayName: 'Container Scan'
+
+    - task: OWASP-Dependency-Check@1
+      inputs:
+        projectName: 'React App'
+        scanPath: '$(Build.SourcesDirectory)'
+        format: 'HTML'
+      displayName: 'OWASP Dependency Check'
+
+    - task: Checkmarx@1
+      inputs:
+        projectName: 'React App'
+        preset: 'High and Medium'
+      displayName: 'Checkmarx SAST Scan'
+
+- stage: Performance
+  displayName: Performance Testing
+  jobs:
+  - job: LoadTest
+    steps:
+    - task: ApacheJMeterLoadTest@1
+      inputs:
+        testPlan: '$(System.DefaultWorkingDirectory)/tests/performance/load-test.jmx'
+        outputDir: '$(Build.ArtifactStagingDirectory)/loadtest'
+    
+  - job: Lighthouse
+    steps:
+    - script: |
+        npm install -g lighthouse
+        lighthouse $(PreviewUrl) --output html --output-path $(Build.ArtifactStagingDirectory)/lighthouse.html
+      displayName: 'Run Lighthouse Audit'
+
+- stage: PublishArtifact
+  displayName: Publish to JFrog
+  dependsOn: 
+  - SecurityScan
+  - Performance
+  condition: succeeded()
+  jobs:
+  - job: PublishNpm
+    displayName: Publish NPM Package
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '20.x'
+      displayName: 'Install Node.js'
+
+    - task: Npm@1
+      inputs:
+        command: 'custom'
+        customCommand: 'version $(artifactVersion) --no-git-tag-version'
+      displayName: 'Update package version'
+
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: '$(Build.SourcesDirectory)'
+        includeRootFolder: false
+        archiveType: 'tar'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).tgz'
+        replaceExistingArchive: true
+      displayName: 'Create package archive'
+
+    - task: ArtifactoryNpm@2
+      inputs:
+        command: 'publish'
+        artifactoryService: '$(artifactoryService)'
+        artifactoryRepo: '$(artifactoryRepo)'
+        collectBuildInfo: true
+        buildName: '$(Build.DefinitionName)'
+        buildNumber: '$(Build.BuildId)'
+        includeEnvVars: true
+      displayName: 'Publish to JFrog Artifactory'
+
+    - task: ArtifactoryBuildInfo@1
+      inputs:
+        artifactoryService: '$(artifactoryService)'
+        buildName: '$(Build.DefinitionName)'
+        buildNumber: '$(Build.BuildId)'
+        includeEnvVars: true
+      displayName: 'Publish Build Info'
+
+- stage: Build
+  displayName: Build and push stage
+  jobs:
+  - job: Build
+    displayName: Build and Push
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+          latest
+
+- stage: SetupMonitoring
+  displayName: Setup Monitoring
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: MonitoringSetup
+    displayName: Setup Prometheus and Grafana
+    environment: 'production'
+    pool:
+      vmImage: $(vmImageName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: Kubernetes@1
+            displayName: 'Create monitoring namespace'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: $(k8sConnection)
+              command: 'apply'
+              arguments: '-f - <<EOF
+                apiVersion: v1
+                kind: Namespace
+                metadata:
+                  name: $(monitoringNamespace)
+                EOF'
+              
+          - task: Bash@3
+            displayName: 'Check Prometheus deployment'
+            name: checkPrometheus
+            inputs:
+              targetType: 'inline'
+              script: |
+                PROMETHEUS_STATUS=$(kubectl --namespace=$(monitoringNamespace) get deployment prometheus -o json 2>/dev/null | jq -r '.status.availableReplicas // 0')
+                echo "##vso[task.setvariable variable=prometheusExists;isOutput=true]$([[ "$PROMETHEUS_STATUS" -gt 0 ]] && echo "true" || echo "false")"
+
+          - task: KubernetesManifest@0
+            displayName: Deploy Prometheus
+            condition: eq(dependencies.checkPrometheus.outputs['prometheusExists'], 'false')
+            inputs:
+              action: deploy
+              kubernetesServiceConnection: $(k8sConnection)
+              namespace: $(monitoringNamespace)
+              manifests: |
+                $(Pipeline.Workspace)/k8s/prometheus/prometheus-configmap.yaml
+                $(Pipeline.Workspace)/k8s/prometheus/prometheus-deployment.yaml
+                $(Pipeline.Workspace)/k8s/prometheus/prometheus-service.yaml
+
+          - task: Bash@3
+            displayName: 'Check Grafana deployment'
+            name: checkGrafana
+            inputs:
+              targetType: 'inline'
+              script: |
+                GRAFANA_STATUS=$(kubectl --namespace=$(monitoringNamespace) get deployment grafana -o json 2>/dev/null | jq -r '.status.availableReplicas // 0')
+                echo "##vso[task.setvariable variable=grafanaExists;isOutput=true]$([[ "$GRAFANA_STATUS" -gt 0 ]] && echo "true" || echo "false")"
+
+          - task: KubernetesManifest@0
+            displayName: Deploy Grafana
+            condition: eq(dependencies.checkGrafana.outputs['grafanaExists'], 'false')
+            inputs:
+              action: deploy
+              kubernetesServiceConnection: $(k8sConnection)
+              namespace: $(monitoringNamespace)
+              manifests: |
+                $(Pipeline.Workspace)/k8s/grafana/grafana-deployment.yaml
+                $(Pipeline.Workspace)/k8s/grafana/grafana-service.yaml
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: SetupMonitoring
+  condition: succeeded()
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy to AKS
+    environment: 'production'
+    pool:
+      vmImage: $(vmImageName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: Create secret for ACR
+            inputs:
+              action: createSecret
+              kubernetesServiceConnection: $(k8sConnection)
+              namespace: $(k8sNamespace)
+              secretType: dockerRegistry
+              secretName: acr-secret
+              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: deploy
+              kubernetesServiceConnection: $(k8sConnection)
+              namespace: $(k8sNamespace)
+              manifests: |
+                $(Pipeline.Workspace)/k8s/deployment.yaml
+                $(Pipeline.Workspace)/k8s/service.yaml
+                $(Pipeline.Workspace)/k8s/ingress.yaml
+                $(Pipeline.Workspace)/k8s/configmap.yaml
+                $(Pipeline.Workspace)/k8s/hpa.yaml
+              containers: |
+                $(containerRegistry)/$(imageRepository):$(tag)
+
+          - task: KubernetesManifest@0
+            displayName: Scale deployment
+            inputs:
+              action: scale
+              kubernetesServiceConnection: $(k8sConnection)
+              namespace: $(k8sNamespace)
+              kind: deployment
+              name: react-app
+              replicas: '3'
+
+          - task: Kubernetes@1
+            displayName: Check deployment status
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceEndpoint: $(k8sConnection)
+              namespace: $(k8sNamespace)
+              command: 'get'
+              arguments: 'pods'
+
+- stage: PostDeployment
+  displayName: Post Deployment Tasks
+  dependsOn: Deploy
+  jobs:
+  - job: Smoke
+    displayName: Smoke Tests
+    steps:
+    - script: |
+        curl -f $(deploymentUrl)/health
+      displayName: 'Run Health Check'
+
+  - job: BackupVerification
+    displayName: Verify Backups
+    steps:
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: 'Your-Azure-Subscription'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az backup job list --vault-name $(backupVaultName) --resource-group $(resourceGroup)
+
+  - job: Documentation
+    displayName: Update Documentation
+    steps:
+    - script: |
+        npm run generate-docs
+      displayName: 'Generate API Documentation'
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/docs'
+        artifactName: 'documentation'
+
+- stage: Compliance
+  displayName: Compliance Checks
+  dependsOn: PostDeployment
+  jobs:
+  - job: ComplianceAudit
+    steps:
+    - task: AzurePolicyCompliance@1
+      inputs:
+        azureSubscription: 'Your-Azure-Subscription'
+        resourceGroupName: $(resourceGroup)
+    
+    - task: SecurityComplianceAssessment@1
+      inputs:
+        scanType: 'Full'
+        reportType: 'Executive'
